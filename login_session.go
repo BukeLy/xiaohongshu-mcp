@@ -30,6 +30,18 @@ func (l *loginSessions) start(cancel func()) uint64 {
 	return seq
 }
 
+// cancelCurrent 结束当前待扫码会话（如果有）。
+func (l *loginSessions) cancelCurrent() {
+	l.mu.Lock()
+	prev := l.cancel
+	l.cancel = nil
+	l.mu.Unlock()
+
+	if prev != nil {
+		prev()
+	}
+}
+
 // finish 会话自己结束时清理登记。仅当它仍是当前会话才清，
 // 否则会把后来者的登记抹掉，导致后来者永远不会被 start 关闭。
 func (l *loginSessions) finish(seq uint64) {
