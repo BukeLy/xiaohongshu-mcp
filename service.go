@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -138,6 +139,8 @@ func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatus
 
 // GetLoginQrcode 获取登录的扫码二维码
 func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeResponse, error) {
+	// 上一个待扫码会话占着浏览器名额，先关掉它，否则这里会一直排队。
+	s.logins.cancelCurrent()
 	b := newBrowser()
 	// 建页和取码都可能 panic。只有后台接手扫码后，才由它关闭浏览器。
 	handedOff := false
@@ -645,11 +648,46 @@ func (s *XiaohongshuService) ReplyNotification(ctx context.Context, commentID, c
 	return xiaohongshu.NewNotificationAction(page).Reply(ctx, commentID, content)
 }
 
-func newBrowser() *headless_browser.Browser {
-	return browser.NewBrowser(configs.IsHeadless(),
-		browser.WithFingerprintSeed(configs.FingerprintSeed()),
-		browser.WithProxy(configs.Proxy()),
-	)
+// browserSlot 让同一时刻只开一个浏览器，多余的请求排队。
+// 每次调用都新起一个 Chrome，实测约 880 MB（2026-11-17，2 GB 机器、容器上限 1 GiB）；
+// 并发几个就会把内存吃光、全部超时。
+var browserSlot = make(chan struct{}, 1)
+
+// queuedBrowser 关闭时归还名额。
+type queuedBrowser struct {
+	*headless_browser.Browser
+	release func()
+}
+
+func (b *queuedBrowser) Close() {
+	defer b.release()
+	b.Browser.Close()
+}
+
+func newBrowser() *queuedBrowser {
+	return queueBrowser(func() *headless_browser.Browser {
+		return browser.NewBrowser(configs.IsHeadless(),
+			browser.WithFingerprintSeed(configs.FingerprintSeed()),
+			browser.WithProxy(configs.Proxy()),
+		)
+	})
+}
+
+// queueBrowser 拿到名额再启动；启动 panic 时归还名额，否则后面的请求会永远等下去。
+func queueBrowser(launch func() *headless_browser.Browser) *queuedBrowser {
+	browserSlot <- struct{}{}
+	release := sync.OnceFunc(func() { <-browserSlot })
+
+	launched := false
+	defer func() {
+		if !launched {
+			release()
+		}
+	}()
+	b := launch()
+	launched = true
+
+	return &queuedBrowser{Browser: b, release: release}
 }
 
 func saveCookies(page *rod.Page) error {
